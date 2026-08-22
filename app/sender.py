@@ -260,7 +260,17 @@ async def _confirm_outgoing_message(
                 if (!isNewMessage) return false;
                 if (expectedText) {
                     const normalize = value => (value || '').replace(/[\\s\\u200B\\u200C\\u200D\\uFEFF]+/g, ' ').trim();
-                    return normalize(content.innerText).includes(normalize(expectedText));
+                    const renderedText = [
+                        content.innerText,
+                        content.getAttribute('title'),
+                        content.getAttribute('aria-label'),
+                        ...[...content.querySelectorAll('[title], [aria-label], [alt]')].flatMap(element => [
+                            element.getAttribute('title'),
+                            element.getAttribute('aria-label'),
+                            element.getAttribute('alt'),
+                        ]),
+                    ].filter(Boolean).map(normalize);
+                    return renderedText.some(value => value.includes(normalize(expectedText)));
                 }
                 if (!expectedResource) return true;
                 const images = [...content.querySelectorAll('img')];
