@@ -6,6 +6,11 @@ on:
     - cron: "17 4 * * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Force the merge-and-test path even when upstream is already included
+        type: boolean
+        default: false
 
 concurrency:
   group: upstream-sync
@@ -37,7 +42,10 @@ jobs:
         id: check
         shell: bash
         run: |
-          if git merge-base --is-ancestor upstream/main HEAD; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force }}" == "true" ]]; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "手动强制检查：执行完整合并、测试和推送流程。" >> "$GITHUB_STEP_SUMMARY"
+          elif git merge-base --is-ancestor upstream/main HEAD; then
             echo "has_updates=false" >> "$GITHUB_OUTPUT"
             echo "上游没有新提交，跳过同步。" >> "$GITHUB_STEP_SUMMARY"
           else
