@@ -74,7 +74,7 @@ jobs:
 
       - name: Verify write-back path (manual check only)
         if: steps.merge.outputs.merged == 'true' && github.event_name == 'workflow_dispatch' && inputs.force == 'true'
-        run: git commit --allow-empty -m "chore: verify automated sync write path"
+        run: 'git commit --allow-empty -m "chore: verify automated sync write path"'
 
       - name: Reapply local runtime settings
         if: steps.merge.outputs.merged == 'true'
