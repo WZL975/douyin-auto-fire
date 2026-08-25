@@ -1,0 +1,96 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 北京时间每天 04:17，避开整点调度高峰
+    - cron: "17 4 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out current project
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/unmev/douyin-auto-fire.git
+          git fetch --prune origin main
+          git fetch --prune upstream main
+
+      - name: Check for upstream updates
+        id: check
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有新提交，跳过同步。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "检测到上游有新提交，开始合并并测试。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Merge upstream with upstream code preferred
+        id: merge
+        if: steps.check.outputs.has_updates == 'true'
+        shell: bash
+        run: |
+          if ! git merge --no-edit --no-ff -X theirs upstream/main; then
+            git merge --abort || true
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游更新与本项目的自定义修改发生冲突，本次暂不更新。"
+            {
+              echo "## 上游同步暂停"
+              echo
+              echo "上游代码无法自动合并，本次没有推送更新。"
+              echo "下次检查会继续尝试，不会影响当前版本的定时续火花。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Reapply local runtime settings
+        if: steps.merge.outputs.merged == 'true'
+        run: python3 scripts/apply_local_overrides.py
+
+      - name: Set up Python
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          pip install -r requirements-dev.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run tests before publishing the update
+        if: steps.merge.outputs.merged == 'true'
+        run: python -m pytest -q
+
+      - name: Publish tested update
+        if: steps.merge.outputs.merged == 'true'
+        shell: bash
+        run: |
+          git push origin HEAD:main
+          {
+            echo "## 上游同步完成"
+            echo
+            echo "上游更新已经通过测试并推送到 main。"
+          } >> "$GITHUB_STEP_SUMMARY"

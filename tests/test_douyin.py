@@ -25,47 +25,91 @@ async def test_search_failure_raises_without_page_text_or_real_name(monkeypatch)
     assert "张三" not in message
 
 
-@pytest.mark.asyncio
-async def test_search_result_accepts_visible_partial_text() -> None:
+def _locator_group(items: list[MagicMock]) -> MagicMock:
+    group = MagicMock()
+    group.count = AsyncMock(return_value=len(items))
+    group.nth.side_effect = lambda index: items[index]
+    if items:
+        group.first = items[0]
+    else:
+        empty = MagicMock()
+        empty.count = AsyncMock(return_value=0)
+        empty.is_visible = AsyncMock(return_value=False)
+        group.first = empty
+    return group
+
+
+def _search_page(names: list[str]) -> tuple[MagicMock, list[MagicMock]]:
     page = MagicMock()
-    rows = MagicMock()
-    page.locator.return_value.filter.return_value = rows
-    rows.count = AsyncMock(return_value=0)
-    exact = MagicMock()
-    partial = MagicMock()
-    page.get_by_text.side_effect = [exact, partial]
-    exact.count = AsyncMock(return_value=0)
-    partial.count = AsyncMock(return_value=1)
-    candidate = MagicMock()
-    candidate.is_visible = AsyncMock(return_value=True)
-    partial.nth.return_value = candidate
+    empty = _locator_group([])
+    items: list[MagicMock] = []
+    buttons: list[MagicMock] = []
 
-    result = await DouyinChat(page)._search_result("好友")
+    for displayed_name in names:
+        name_node = MagicMock()
+        name_node.inner_text = AsyncMock(return_value=f" {displayed_name} ")
+        name_node.is_visible = AsyncMock(return_value=True)
+        exact_names = _locator_group([name_node])
+        button = MagicMock(name=f"message-{displayed_name}")
+        button.count = AsyncMock(return_value=1)
+        button.is_visible = AsyncMock(return_value=True)
+        button_group = _locator_group([button])
+        item = MagicMock()
+        item.is_visible = AsyncMock(return_value=True)
 
-    assert result is candidate
+        def item_locator(
+            selector: str,
+            *,
+            button_group=button_group,
+            exact_names=exact_names,
+        ):
+            if selector == '[class*="SearchPanelitemchat_btn"]':
+                return button_group
+            if selector == '[class*="SearchPanelitemname"]':
+                return exact_names
+            return empty
+
+        item.locator.side_effect = item_locator
+        items.append(item)
+        buttons.append(button)
+
+    search_items = _locator_group(items)
+
+    def page_locator(selector: str):
+        if selector == '[class*="SearchPanelitembox"], [class*="SearchPanelitem-box"], [class*="SearchPanelitem_box"]':
+            return search_items
+        return empty
+
+    page.locator.side_effect = page_locator
+    page.get_by_text.return_value = empty
+    return page, buttons
 
 
 @pytest.mark.asyncio
-async def test_search_result_ignores_hidden_exact_match() -> None:
-    page = MagicMock()
-    rows = MagicMock()
-    page.locator.return_value.filter.return_value = rows
-    rows.count = AsyncMock(return_value=0)
-    exact = MagicMock()
-    partial = MagicMock()
-    page.get_by_text.side_effect = [exact, partial]
-    exact.count = AsyncMock(return_value=1)
-    hidden = MagicMock()
-    hidden.is_visible = AsyncMock(return_value=False)
-    exact.nth.return_value = hidden
-    partial.count = AsyncMock(return_value=1)
-    visible = MagicMock()
-    visible.is_visible = AsyncMock(return_value=True)
-    partial.nth.return_value = visible
+async def test_search_result_selects_exact_name_when_one_name_contains_another() -> None:
+    page, buttons = _search_page(["test1", "test"])
 
-    result = await DouyinChat(page)._search_result("好友")
+    result = await DouyinChat(page)._search_result("test")
 
-    assert result is visible
+    assert result is buttons[1]
+
+
+@pytest.mark.asyncio
+async def test_search_result_selects_longer_exact_name() -> None:
+    page, buttons = _search_page(["test1", "test"])
+
+    result = await DouyinChat(page)._search_result("test1")
+
+    assert result is buttons[0]
+
+
+@pytest.mark.asyncio
+async def test_search_result_keeps_normal_exact_match_working() -> None:
+    page, buttons = _search_page(["好友A"])
+
+    result = await DouyinChat(page)._search_result("好友A")
+
+    assert result is buttons[0]
 
 
 @pytest.mark.asyncio
@@ -151,69 +195,99 @@ async def test_confirm_opened_raises_on_timeout() -> None:
         await chat._confirm_opened("好友A")
 
 
-@pytest.mark.asyncio
-async def test_chat_open_error_accepts_panel_marker_with_name() -> None:
+def _chat_page(
+    header_name: str,
+    *,
+    input_count: int = 1,
+    header_selector: str = CHAT_PANEL_MARKERS[0],
+    header_visible: bool = True,
+    name_visible: bool = True,
+    stale_name: str | None = None,
+) -> MagicMock:
     page = MagicMock()
-    marker = MagicMock()
-    marker.count = AsyncMock(return_value=1)
-    filtered = MagicMock()
-    filtered.first = marker
-    chain = MagicMock()
-    chain.filter = MagicMock(return_value=filtered)
-    page.locator.return_value = chain
+    empty = _locator_group([])
+    header_name_node = MagicMock()
+    header_name_node.inner_text = AsyncMock(return_value=f" {header_name} ")
+    header_name_node.is_visible = AsyncMock(return_value=name_visible)
+    nodes = [header_name_node]
+    if stale_name is not None:
+        stale_node = MagicMock()
+        stale_node.inner_text = AsyncMock(return_value=f" {stale_name} ")
+        stale_node.is_visible = AsyncMock(return_value=False)
+        nodes.append(stale_node)
+    exact_names = _locator_group(nodes)
+    header = MagicMock()
+    header.count = AsyncMock(return_value=1)
+    header.is_visible = AsyncMock(return_value=header_visible)
+    header.locator.side_effect = lambda selector: exact_names if selector == '[class*="RightPanelHeadertitle"]' else empty
 
-    chat = DouyinChat(page)
+    def header_group() -> MagicMock:
+        return _locator_group([header])
 
-    assert await chat._chat_open_error("好友A") is None
-
-
-def _routed_page(*, name_in_body: str, input_count: int) -> MagicMock:
-    page = MagicMock()
-    body = MagicMock()
-    body.inner_text = AsyncMock(return_value=name_in_body)
-    first_target = MagicMock()
-    first_target.count = AsyncMock(return_value=input_count)
-    first_target.is_visible = AsyncMock(return_value=True)
+    composer_target = MagicMock()
+    composer_target.count = AsyncMock(return_value=input_count)
+    composer_target.is_visible = AsyncMock(return_value=bool(input_count))
     composer = MagicMock()
-    composer.first = first_target
-    filtered_first = MagicMock()
-    filtered_first.count = AsyncMock(return_value=0)
-    filtered = MagicMock()
-    filtered.first = filtered_first
-    chain = MagicMock()
-    chain.filter = MagicMock(return_value=filtered)
-    get_by_text = MagicMock()
-    get_by_text.count = AsyncMock(return_value=0)
-    page.get_by_text.return_value = get_by_text
+    composer.first = composer_target
 
     def locator_router(selector: str):
-        if selector == "body":
-            return body
+        if selector == header_selector:
+            return header_group()
         if selector in MESSAGE_INPUTS:
             return composer
-        return chain
+        return empty
 
     page.locator.side_effect = locator_router
     return page
 
 
 @pytest.mark.asyncio
-async def test_chat_open_error_accepts_composer_and_page_name() -> None:
-    assert CHAT_PANEL_MARKERS
-    page = _routed_page(name_in_body="页面内容 好友A 你好", input_count=1)
+async def test_chat_open_error_accepts_exact_name_in_each_header_fallback() -> None:
+    for header_selector in CHAT_PANEL_MARKERS[:3]:
+        page = _chat_page("好友A", header_selector=header_selector)
 
-    chat = DouyinChat(page)
+        error = await DouyinChat(page)._chat_open_error("好友A")
 
-    assert await chat._chat_open_error("好友A") is None
+        assert error is None
 
 
 @pytest.mark.asyncio
-async def test_chat_open_error_rejects_when_name_absent() -> None:
-    page = _routed_page(name_in_body="页面没有目标好友", input_count=0)
+async def test_chat_open_error_rejects_hidden_exact_header_name() -> None:
+    page = _chat_page("test", header_visible=False)
 
-    chat = DouyinChat(page)
+    error = await DouyinChat(page)._chat_open_error("test")
 
-    error = await chat._chat_open_error("好友A")
+    assert isinstance(error, PageOperationError)
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_rejects_containing_header_name() -> None:
+    page = _chat_page("test1")
+
+    error = await DouyinChat(page)._chat_open_error("test")
+
+    assert isinstance(error, PageOperationError)
+    assert "无法确认聊天已打开" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_rejects_hidden_stale_name_in_visible_header() -> None:
+    # Visible current chat is `test1`, but the header retains a hidden stale name
+    # node equal to the requested `test`. The hidden stale node must not confirm
+    # the wrong recipient; only a visible exact title node may.
+    page = _chat_page("test1", stale_name="test")
+
+    error = await DouyinChat(page)._chat_open_error("test")
+
+    assert isinstance(error, PageOperationError)
+    assert "无法确认聊天已打开" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_rejects_when_header_name_absent() -> None:
+    page = _chat_page("其他好友", input_count=0)
+
+    error = await DouyinChat(page)._chat_open_error("好友A")
 
     assert isinstance(error, PageOperationError)
     assert "无法确认聊天已打开" in str(error)
