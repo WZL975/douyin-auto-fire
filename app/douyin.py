@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from playwright.async_api import Locator, Page
 
@@ -73,9 +74,27 @@ class DouyinChat:
             '[class*="SearchPanelitem_name"]',
             '[class*="SearchPanelitem-name"]',
         )
+
+        # Two-phase priority: an exact friend name always wins over a group whose
+        # display name happens to start with it. Pass 1 scans every search row for
+        # an exact name; only if none is found does pass 2 accept a group member
+        # count suffix like "4161(7)" for target "4161". This ordering guarantees
+        # "test" never returns "test(7)" or "test1".
         for index in range(await search_items.count()):
             item = search_items.nth(index)
             name_locator = await _visible_exact_text_locator(item, name_selectors, name)
+            if name_locator is None:
+                continue
+            button = item.locator('[class*="SearchPanelitemchat_btn"]').first
+            try:
+                if await button.count() and await button.is_visible():
+                    return button
+            except Exception:
+                continue
+
+        for index in range(await search_items.count()):
+            item = search_items.nth(index)
+            name_locator = await _visible_group_text_locator(item, name_selectors, name)
             if name_locator is None:
                 continue
             button = item.locator('[class*="SearchPanelitemchat_btn"]').first
@@ -113,8 +132,24 @@ class DouyinChat:
                 except Exception:
                     continue
 
+        # Second-phase group suffix over conversation rows (same priority rule).
+        for selector in row_selectors:
+            rows = self.page.locator(selector)
+            for index in range(await rows.count()):
+                row = rows.nth(index)
+                title_locator = await _visible_group_text_locator(row, title_selectors, name)
+                if title_locator is None:
+                    continue
+                try:
+                    if await row.is_visible():
+                        return row
+                except Exception:
+                    continue
+
         # Some Douyin builds render the title itself as hidden, but keep a visible
         # ancestor as the actionable result. Find that ancestor from the hidden title.
+        # This hidden-title fallback stays STRICT exact only: a hidden stale name
+        # node (group or plain) must never be trusted to resolve the recipient.
         hidden_titles = self.page.locator('[class*="conversationConversationItemtitle"]')
         for index in range(await hidden_titles.count()):
             title = hidden_titles.nth(index)
@@ -170,7 +205,7 @@ class DouyinChat:
                         continue
                 except Exception:
                     continue
-                if await _visible_exact_text_in(header, title_selectors, name):
+                if await _visible_exact_or_group_text_in(header, title_selectors, name):
                     return None
 
         composer_visible = await self._composer_visible()
@@ -209,6 +244,36 @@ async def _visible_exact_text_locator(
     return None
 
 
+async def _visible_group_text_locator(
+    container: Locator, selectors: tuple[str, ...], expected: str
+) -> Locator | None:
+    # Second-phase match for group chats: accepts a trailing "(N)"/"（N）"
+    # member count. Only reached after the exact pass found nothing, so a bare
+    # "test" never reaches here when an exact "test" row exists.
+    for selector in selectors:
+        nodes = container.locator(selector)
+        for index in range(await nodes.count()):
+            node = nodes.nth(index)
+            if await _group_name_matches(node, expected):
+                try:
+                    if await node.is_visible():
+                        return node
+                except Exception:
+                    continue
+    return None
+
+
+async def _visible_exact_or_group_text_in(
+    container: Locator, selectors: tuple[str, ...], expected: str
+) -> bool:
+    # Chat-header confirmation: an exact title wins; otherwise a group member
+    # count suffix also confirms. The node must be visible in both cases, so a
+    # hidden stale title node can never confirm the wrong recipient.
+    if await _visible_exact_text_locator(container, selectors, expected) is not None:
+        return True
+    return await _visible_group_text_locator(container, selectors, expected) is not None
+
+
 async def _has_exact_text_in(container: Locator, selectors: tuple[str, ...], expected: str) -> bool:
     for selector in selectors:
         if await _has_exact_text(container.locator(selector), expected):
@@ -226,6 +291,33 @@ async def _has_exact_text(locators: Locator, expected: str) -> bool:
 async def _text_equals(locator: Locator, expected: str) -> bool:
     try:
         return (await locator.inner_text(timeout=500)).strip() == expected
+    except Exception:
+        return False
+
+
+# Matches a group chat display name: the configured target name optionally
+# followed by exactly one pair of brackets containing a pure member count,
+# e.g. "4161" / "4161(7)" / "4161（123）". This is an INDEPENDENT helper kept
+# separate from _text_equals so the friend exact-match semantics stay strict:
+# it must never let "test" match "test1" (no trailing brackets to legitimize a
+# longer name). re.fullmatch anchors both ends; re.escape makes the name literal.
+_GROUP_COUNT_SUFFIX_RE_TEMPLATE = r"{name}\s*[\(（]\s*\d+\s*[\)）]"
+
+
+def _group_count_suffix_matches(actual: str, expected: str) -> bool:
+    actual = actual.strip()
+    expected = expected.strip()
+    if actual == expected:
+        return True
+    pattern = _GROUP_COUNT_SUFFIX_RE_TEMPLATE.format(name=re.escape(expected))
+    return re.fullmatch(pattern, actual) is not None
+
+
+async def _group_name_matches(locator: Locator, expected: str) -> bool:
+    try:
+        return _group_count_suffix_matches(
+            await locator.inner_text(timeout=500), expected
+        )
     except Exception:
         return False
 

@@ -113,6 +113,60 @@ async def test_search_result_keeps_normal_exact_match_working() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_result_accepts_group_count_suffix() -> None:
+    # Group chats render as "<name>(<member count>)" in the search panel, e.g.
+    # target "4161" is displayed as "4161(7)". The strict exact match alone would
+    # reject this and break group sending.
+    page, buttons = _search_page(["4161(7)"])
+
+    result = await DouyinChat(page)._search_result("4161")
+
+    assert result is buttons[0]
+
+
+@pytest.mark.asyncio
+async def test_search_result_accepts_fullwidth_group_count_suffix() -> None:
+    page, buttons = _search_page(["4161（7）"])
+
+    result = await DouyinChat(page)._search_result("4161")
+
+    assert result is buttons[0]
+
+
+@pytest.mark.asyncio
+async def test_search_result_prefers_exact_name_over_group_suffix() -> None:
+    # When both an exact "test" and a group-suffixed "test(7)" exist, the exact
+    # friend must win even though "test(7)" sorts first. A naive single-pass
+    # suffix check would wrongly return the group row.
+    page, buttons = _search_page(["test(7)", "test"])
+
+    result = await DouyinChat(page)._search_result("test")
+
+    assert result is buttons[1]
+
+
+@pytest.mark.asyncio
+async def test_search_result_rejects_non_digit_group_suffix() -> None:
+    # "(abc)" is not a member count; must not match target "test".
+    page, _buttons = _search_page(["test(abc)"])
+
+    result = await DouyinChat(page)._search_result("test")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_search_result_rejects_containing_name_for_group_rule() -> None:
+    # The group-suffix rule must not reintroduce the test/test1 mis-routing:
+    # "test1" has no trailing member-count brackets, so it must be rejected.
+    page, _buttons = _search_page(["test1"])
+
+    result = await DouyinChat(page)._search_result("test")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_open_target_retries_after_failed_first_attempt() -> None:
     page = MagicMock()
     page.wait_for_timeout = AsyncMock()
@@ -284,6 +338,51 @@ async def test_chat_open_error_rejects_hidden_stale_name_in_visible_header() -> 
 
 
 @pytest.mark.asyncio
+async def test_chat_open_error_accepts_group_count_suffix_in_header() -> None:
+    # Right-side group chat header shows "4161(7)" while the configured target
+    # is bare "4161". Confirmation must succeed so group chats can be sent.
+    page = _chat_page("4161(7)")
+
+    error = await DouyinChat(page)._chat_open_error("4161")
+
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_accepts_fullwidth_group_count_suffix_in_header() -> None:
+    page = _chat_page("4161（7）")
+
+    error = await DouyinChat(page)._chat_open_error("4161")
+
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_still_rejects_containing_header_name() -> None:
+    # The group rule must not weaken the test/test1 guard: a header "test1" must
+    # not confirm target "test" (no trailing member-count brackets).
+    page = _chat_page("test1")
+
+    error = await DouyinChat(page)._chat_open_error("test")
+
+    assert isinstance(error, PageOperationError)
+
+
+@pytest.mark.asyncio
+async def test_chat_open_error_rejects_hidden_stale_group_name_in_visible_header() -> None:
+    # Visible current chat is "test1" but the header retains a hidden stale
+    # node "test(7)". The hidden stale node must not confirm target "test";
+    # only a visible title node may confirm. This preserves the stale-header
+    # safety check under the new group-suffix logic.
+    page = _chat_page("test1", stale_name="test(7)")
+
+    error = await DouyinChat(page)._chat_open_error("test")
+
+    assert isinstance(error, PageOperationError)
+    assert "无法确认聊天已打开" in str(error)
+
+
+@pytest.mark.asyncio
 async def test_chat_open_error_rejects_when_header_name_absent() -> None:
     page = _chat_page("其他好友", input_count=0)
 
@@ -291,3 +390,60 @@ async def test_chat_open_error_rejects_when_header_name_absent() -> None:
 
     assert isinstance(error, PageOperationError)
     assert "无法确认聊天已打开" in str(error)
+
+
+# Direct unit tests for the standalone group-suffix matcher. The friend exact
+# matcher (_text_equals) stays strict; only this independent helper accepts a
+# trailing "(N)" / "（N）" member count, and nothing else.
+import re  # noqa: E402
+
+from app.douyin import _group_count_suffix_matches  # noqa: E402
+
+
+def test_group_count_suffix_matches_accepts_bare_name() -> None:
+    assert _group_count_suffix_matches("4161", "4161")
+
+
+def test_group_count_suffix_matches_accepts_halfwidth_suffix() -> None:
+    assert _group_count_suffix_matches("4161(7)", "4161")
+
+
+def test_group_count_suffix_matches_accepts_fullwidth_suffix() -> None:
+    assert _group_count_suffix_matches("4161（123）", "4161")
+
+
+def test_group_count_suffix_matches_accepts_internal_spaces() -> None:
+    assert _group_count_suffix_matches("4161 ( 7 )", "4161")
+
+
+def test_group_count_suffix_matches_rejects_non_digit_suffix() -> None:
+    assert not _group_count_suffix_matches("4161(abc)", "4161")
+
+
+def test_group_count_suffix_matches_rejects_empty_suffix() -> None:
+    assert not _group_count_suffix_matches("4161()", "4161")
+
+
+def test_group_count_suffix_matches_rejects_trailing_chars() -> None:
+    assert not _group_count_suffix_matches("4161(7)abc", "4161")
+
+
+def test_group_count_suffix_matches_rejects_prefix() -> None:
+    assert not _group_count_suffix_matches("abc4161(7)", "4161")
+
+
+def test_group_count_suffix_matches_rejects_longer_name() -> None:
+    # The core test/test1 safety property: expected "test" must not match the
+    # longer bare name "test1" (no member-count brackets to legitimize it).
+    assert not _group_count_suffix_matches("test1", "test")
+
+
+def test_group_count_suffix_matches_escapes_expected_regex_meta() -> None:
+    # re.escape must be used so a name like "a.b" is literal, not "any char".
+    assert _group_count_suffix_matches("a.b(7)", "a.b")
+    assert not _group_count_suffix_matches("aXb(7)", "a.b")
+
+
+# Suppress the unused `re` import warning the linter may raise for the
+# pure-assertion block above; `re` is intentionally kept as a sanity anchor.
+_ = re
