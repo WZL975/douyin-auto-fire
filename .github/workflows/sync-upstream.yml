@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Force the merge-and-test path even when upstream is already included
+        description: Run full validation when upstream is current; do not publish without updates
         type: boolean
         default: false
 
@@ -38,20 +38,30 @@ jobs:
           git fetch --prune origin main
           git fetch --prune upstream main
 
-      - name: Remember local workflow files
-        id: workflow_inventory
+      - name: Remember current main
+        id: base
         shell: bash
         run: |
-          git ls-tree -r --name-only HEAD .github/workflows/ | sort > "$RUNNER_TEMP/local-workflows.txt"
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            echo "::error::main 在任务开始前已经发生变化，本次同步退出，不使用旧 checkout 推送。"
+            exit 1
+          fi
           echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cp scripts/resolve_sync_conflicts.py "$RUNNER_TEMP/resolve_sync_conflicts.py"
 
       - name: Check for upstream updates
         id: check
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force }}" == "true" ]]; then
-            echo "has_updates=true" >> "$GITHUB_OUTPUT"
-            echo "手动强制检查：执行完整合并、测试和推送流程。" >> "$GITHUB_STEP_SUMMARY"
+            if git merge-base --is-ancestor upstream/main HEAD; then
+              echo "has_updates=false" >> "$GITHUB_OUTPUT"
+              echo "validate=true" >> "$GITHUB_OUTPUT"
+              echo "手动强制验证：上游没有新提交，执行完整恢复和测试，但不发布。" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "has_updates=true" >> "$GITHUB_OUTPUT"
+              echo "手动强制检查：执行完整合并、测试和推送流程。" >> "$GITHUB_STEP_SUMMARY"
+            fi
           elif git merge-base --is-ancestor upstream/main HEAD; then
             echo "has_updates=false" >> "$GITHUB_OUTPUT"
             echo "上游没有新提交，跳过同步。" >> "$GITHUB_STEP_SUMMARY"
@@ -60,77 +70,153 @@ jobs:
             echo "检测到上游有新提交，开始合并并测试。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Keep public schedule alive when needed
+        if: steps.check.outputs.has_updates == 'false' && steps.check.outputs.validate != 'true'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
+        run: python3 scripts/keepalive.py --base-sha "$BASE_SHA"
+
       - name: Merge upstream with upstream code preferred
         id: merge
         if: steps.check.outputs.has_updates == 'true'
         shell: bash
         run: |
-          if ! git merge --no-edit --no-ff -X theirs upstream/main; then
-            git merge --abort || true
-            echo "merged=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::上游更新与本项目的自定义修改发生冲突，本次暂不更新。"
-            {
-              echo "## 上游同步暂停"
-              echo
-              echo "上游代码无法自动合并，本次没有推送更新。"
-              echo "下次检查会继续尝试，不会影响当前版本的定时续火花。"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          if git merge --no-commit --no-edit --no-ff -X theirs upstream/main; then
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              echo "强制检查没有形成新的 merge，跳过发布。" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            if python3 "$RUNNER_TEMP/resolve_sync_conflicts.py" \
+              --repo-root "$GITHUB_WORKSPACE" \
+              --base-sha "${{ steps.base.outputs.base_sha }}" &&
+              [[ -z "$(git diff --name-only --diff-filter=U)" ]] &&
+              git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+            else
+              git merge --abort || true
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              {
+                echo "## 上游同步失败"
+                echo
+                echo "存在未授权的上游冲突，或 merge 没有留下可提交的状态。"
+                echo "本次没有推送更新；请处理冲突后再同步。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
           fi
-          echo "merged=true" >> "$GITHUB_OUTPUT"
 
-      - name: Keep local workflow set
-        if: steps.merge.outputs.merged == 'true'
+      - name: Restore local sync controls
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
         shell: bash
         env:
-          BASE_SHA: ${{ steps.workflow_inventory.outputs.base_sha }}
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
         run: |
-          # 保留本项目自己的同步工作流，避免被上游同名文件覆盖。
-          git checkout "$BASE_SHA" -- .github/workflows/sync-upstream.yml
-          # 上游新增的工作流与续火花无关，且 GITHUB_TOKEN 无法代替 workflows 权限推送它们。
-          comm -13 "$RUNNER_TEMP/local-workflows.txt" <(git ls-tree -r --name-only HEAD .github/workflows/ | sort) |
-            while IFS= read -r path; do
-              [[ -z "$path" ]] || git rm -- "$path"
-            done
+          # 这些文件属于本 fork 的同步控制面。上游删除或改写时，按 BASE 恢复。
+          git checkout "$BASE_SHA" -- \
+            scripts/apply_local_overrides.py \
+            scripts/keepalive.py \
+            scripts/resolve_sync_conflicts.py \
+            tests/test_local_overrides.py \
+            tests/test_sync_integration.py
+          python3 scripts/apply_local_overrides.py --base-sha "$BASE_SHA"
 
-      - name: Verify write-back path (manual check only)
-        if: steps.merge.outputs.merged == 'true' && github.event_name == 'workflow_dispatch' && inputs.force
-        run: 'git commit --allow-empty -m "chore: verify automated sync write path"'
-
-      - name: Reapply local runtime settings
-        if: steps.merge.outputs.merged == 'true'
-        run: python3 scripts/apply_local_overrides.py
+      - name: Stage local compatibility adjustment
+        id: candidate
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
+        shell: bash
+        run: |
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            echo "::error::准备测试前 index 仍有未解决冲突，拒绝继续。"
+            exit 1
+          fi
+          git add --update -- app/sender.py
+          if ! git diff --cached --check; then
+            echo "::error::候选提交存在空白错误，拒绝测试。"
+            exit 1
+          fi
+          echo "tree=$(git write-tree)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
-        if: steps.merge.outputs.merged == 'true'
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
       - name: Install test dependencies
-        if: steps.merge.outputs.merged == 'true'
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
         run: |
           pip install -r requirements-dev.txt
           python -m playwright install --with-deps chromium
 
       - name: Run tests before publishing the update
-        if: steps.merge.outputs.merged == 'true'
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
         run: python -m pytest -q
 
-      - name: Commit local sync adjustments
+      - name: Verify final local tree
+        if: steps.merge.outputs.merged == 'true' || steps.check.outputs.validate == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
+          CANDIDATE_TREE: ${{ steps.candidate.outputs.tree }}
+        run: |
+          python3 scripts/apply_local_overrides.py --base-sha "$BASE_SHA" --verify-only
+          if [[ -n "$(git diff --name-only)" ]]; then
+            echo "::error::测试产生了未预期的 tracked 工作区改动，拒绝发布。"
+            git diff --name-only
+            exit 1
+          fi
+          untracked="$(git ls-files --others --exclude-standard)"
+          if [[ -n "$untracked" ]]; then
+            echo "::error::测试产生了未预期的未跟踪文件，拒绝发布："
+            echo "$untracked"
+            exit 1
+          fi
+          if [[ "$(git write-tree)" != "$CANDIDATE_TREE" ]]; then
+            echo "::error::测试后 index tree 与候选 tree 不一致，拒绝发布。"
+            exit 1
+          fi
+
+      - name: Commit tested merge
         if: steps.merge.outputs.merged == 'true'
         shell: bash
         run: |
-          # merge 只会提交合并结果；本地续火花设置和工作流清理需要单独提交后才能推送。
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: preserve local workflow settings"
+          # 候选 tree 已在测试前写入 index；测试后只允许它保持不变。
+          CANDIDATE_TREE="${{ steps.candidate.outputs.tree }}"
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::最终提交不是未完成的 upstream merge，拒绝发布。"
+            exit 1
+          fi
+          for path in \
+            scripts/apply_local_overrides.py \
+            scripts/keepalive.py \
+            scripts/resolve_sync_conflicts.py \
+            tests/test_local_overrides.py \
+            tests/test_sync_integration.py; do
+            git cat-file -e ":$path" || {
+              echo "::error::最终 index 缺少本地同步文件: $path"
+              exit 1
+            }
+          done
+          git commit --no-edit
+          if [[ "$(git rev-parse HEAD^{tree})" != "$CANDIDATE_TREE" ]]; then
+            echo "::error::最终 commit tree 与测试候选 tree 不一致，拒绝发布。"
+            exit 1
           fi
 
       - name: Publish tested update
         if: steps.merge.outputs.merged == 'true'
         shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
         run: |
+          git fetch --prune origin main
+          if [[ "$(git rev-parse origin/main)" != "$BASE_SHA" ]]; then
+            echo "::error::main 在测试期间发生变化，本次拒绝推送，不使用强推覆盖。"
+            exit 1
+          fi
           git push origin HEAD:main
           {
             echo "## 上游同步完成"

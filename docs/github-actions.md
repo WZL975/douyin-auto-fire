@@ -263,11 +263,11 @@ dry_run = false
 
 ```yaml
 schedule:
-  - cron: "0 0 * * *"
+  - cron: "43 0 * * *"
     timezone: "Asia/Shanghai"
 ```
 
-表示每天北京时间 **00:00** 自动运行一次。
+表示每天北京时间 **00:43** 自动运行一次。
 
 定时触发会直接进行真实发送，不会自动进入 Dry Run。
 
@@ -294,6 +294,24 @@ schedule:
 ```text
 分钟 小时 * * *
 ```
+
+### 上游自动同步
+
+仓库另有 `Sync Upstream` 工作流，每天北京时间 **04:17** 检查
+`unmev/douyin-auto-fire` 是否有新提交。
+
+同步默认只合并上游的应用代码、依赖和测试。`.github/workflows/` 整个目录会按本
+fork 同步前的版本原样保留，所以发送任务仍保持每天 **00:43**，同步任务仍保持每天
+**04:17**。这套设置不表示与上游逐文件 100% 一致；上游 workflow 的新增、删除和
+修改需要单独评估。
+
+原因是同步任务使用 `GITHUB_TOKEN` 的 `contents: write` 权限。当前没有配置 PAT，
+因此不会自动推送上游 workflow 文件的变化，避免同步任务因缺少 workflow 权限失败。
+
+公开仓库如果长时间没有提交，GitHub 可能停用 schedule（参见
+[GitHub 的 schedule 说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)）。同步任务在没有上游更新时
+会根据 `main` 最新提交时间最多每 30 天创建一次保活空提交；近期运行不会每天产生
+空提交。
 
 ---
 
