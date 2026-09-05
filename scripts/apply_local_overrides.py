@@ -38,6 +38,63 @@ def _set_send_schedule(text: str) -> str:
             lines[index] = f'{match.group(1)}{LOCAL_CRON}{match.group(3)}{line_ending}'
             return "".join(lines)
 
+    # The upstream template may keep the GitHub Actions schedule commented out
+    # when it expects an external cron service. Re-enable that block for this
+    # fork and keep the local time instead of failing the whole sync.
+    for index, line in enumerate(lines):
+        line_body = line.rstrip("\r\n")
+        line_ending = line[len(line_body) :]
+        schedule_match = re.match(r'^(\s*)#\s*schedule:\s*$', line_body)
+        if not schedule_match:
+            continue
+
+        base_indent = schedule_match.group(1)
+        for cron_index in range(index + 1, min(len(lines), index + 8)):
+            cron_body = lines[cron_index].rstrip("\r\n")
+            cron_ending = lines[cron_index][len(cron_body) :]
+            cron_match = re.match(r'^\s*#\s*-\s*cron:\s*"[^"]*"(.*)$', cron_body)
+            if not cron_match:
+                continue
+
+            lines[index] = f"{base_indent}schedule:{line_ending}"
+            lines[cron_index] = (
+                f'{base_indent}  - cron: "{LOCAL_CRON}"{cron_match.group(1)}{cron_ending}'
+            )
+
+            for timezone_index in range(cron_index + 1, min(len(lines), cron_index + 4)):
+                timezone_body = lines[timezone_index].rstrip("\r\n")
+                timezone_ending = lines[timezone_index][len(timezone_body) :]
+                timezone_match = re.match(r'^\s*#\s*(timezone:.*)$', timezone_body)
+                if timezone_match:
+                    lines[timezone_index] = (
+                        f"{base_indent}    {timezone_match.group(1)}{timezone_ending}"
+                    )
+                    break
+            return "".join(lines)
+
+        # If the upstream keeps only a commented schedule marker, create a
+        # complete active block so future upstream changes remain schedulable.
+        lines[index : index + 1] = [
+            f"{base_indent}schedule:{line_ending}",
+            f'{base_indent}  - cron: "{LOCAL_CRON}"{line_ending}',
+            f'{base_indent}    timezone: "Asia/Shanghai"{line_ending}',
+        ]
+        return "".join(lines)
+
+    # Last-resort compatibility for an upstream template that removes the
+    # schedule block entirely: add it below a mapping-style `on:` declaration.
+    for index, line in enumerate(lines):
+        if line.strip() != "on:":
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        ending = "\n" if line.endswith("\n") else ""
+        lines[index + 1 : index + 1] = [
+            f"{indent}  schedule:{ending}",
+            f'{indent}    - cron: "{LOCAL_CRON}"{ending}',
+            f'{indent}      timezone: "Asia/Shanghai"{ending}',
+        ]
+        return "".join(lines)
+
     raise RuntimeError("无法在 .github/workflows/send.yml 中定位 schedule/cron")
 
 
