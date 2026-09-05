@@ -68,7 +68,8 @@ async def test_authentication_failure_stops_remaining_targets_and_notifies(monke
     with pytest.raises(AuthenticationError, match="登录失效"):
         await main_module.run()
 
-    chat.open_target.assert_awaited_once_with("好友A", retries=1)
+    # 新的实现使用 _open_target_with_retry() 包装器，内部调用时 retries=0
+    chat.open_target.assert_awaited_once_with("好友A", retries=0)
     results = notify.await_args.args[3]
     assert [(result.target, result.status) for result in results] == [("好友A", "failed")]
 

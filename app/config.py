@@ -23,6 +23,11 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
     dingtalk_secret = _optional_env("DINGTALK_SECRET")
     if bool(dingtalk_webhook) != bool(dingtalk_secret):
         raise ConfigError("DINGTALK_WEBHOOK 和 DINGTALK_SECRET 必须同时配置")
+
+    webhook_url = _optional_env("WEBHOOK_URL")
+    webhook_headers = _parse_webhook_headers(_optional_env("WEBHOOK_HEADERS"))
+    webhook_template = _optional_env("WEBHOOK_TEMPLATE")
+
     return Settings(
         task_config_path=task_path,
         storage_state=_optional_env("DOUYIN_STORAGE_STATE") or (str(default_state) if default_state.is_file() else None),
@@ -33,6 +38,9 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         trace=_parse_bool(os.getenv("TRACE", "true"), "TRACE"),
         dingtalk_webhook=dingtalk_webhook,
         dingtalk_secret=dingtalk_secret,
+        webhook_url=webhook_url,
+        webhook_headers=webhook_headers,
+        webhook_template=webhook_template,
     )
 
 
@@ -225,3 +233,39 @@ def _number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{label} 必须是数字")
     return float(value)
+
+
+def _parse_webhook_headers(value: str | None) -> dict[str, str] | None:
+    """解析 WEBHOOK_HEADERS 环境变量为字典。
+
+    支持格式：
+    - JSON 对象: {"Content-Type": "application/json", "Authorization": "Bearer token"}
+    - 键值对: Content-Type=application/json,Authorization=Bearer token
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+
+    # 尝试 JSON 格式（数组或对象都尝试解析）
+    if value.startswith("{") or value.startswith("["):
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ConfigError("WEBHOOK_HEADERS JSON 必须是对象，不能是数组")
+            return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"WEBHOOK_HEADERS JSON 格式错误: {exc}") from exc
+
+    # 尝试键值对格式 key1=value1,key2=value2
+    headers = {}
+    for pair in value.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ConfigError(f"WEBHOOK_HEADERS 键值对格式错误，应为 key=value: {pair}")
+        key, val = pair.split("=", 1)
+        headers[key.strip()] = val.strip()
+    return headers if headers else None
