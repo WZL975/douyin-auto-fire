@@ -38,6 +38,13 @@ jobs:
           git fetch --prune origin main
           git fetch --prune upstream main
 
+      - name: Remember local workflow files
+        id: workflow_inventory
+        shell: bash
+        run: |
+          git ls-tree -r --name-only HEAD .github/workflows/ | sort > "$RUNNER_TEMP/local-workflows.txt"
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Check for upstream updates
         id: check
         shell: bash
@@ -71,6 +78,20 @@ jobs:
             exit 0
           fi
           echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Keep local workflow set
+        if: steps.merge.outputs.merged == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.workflow_inventory.outputs.base_sha }}
+        run: |
+          # 保留本项目自己的同步工作流，避免被上游同名文件覆盖。
+          git checkout "$BASE_SHA" -- .github/workflows/sync-upstream.yml
+          # 上游新增的工作流与续火花无关，且 GITHUB_TOKEN 无法代替 workflows 权限推送它们。
+          comm -13 "$RUNNER_TEMP/local-workflows.txt" <(git ls-tree -r --name-only HEAD .github/workflows/ | sort) |
+            while IFS= read -r path; do
+              [[ -z "$path" ]] || git rm -- "$path"
+            done
 
       - name: Verify write-back path (manual check only)
         if: steps.merge.outputs.merged == 'true' && github.event_name == 'workflow_dispatch' && inputs.force
