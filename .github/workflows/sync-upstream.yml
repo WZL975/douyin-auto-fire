@@ -117,6 +117,16 @@ jobs:
         if: steps.merge.outputs.merged == 'true'
         run: python -m pytest -q
 
+      - name: Commit local sync adjustments
+        if: steps.merge.outputs.merged == 'true'
+        shell: bash
+        run: |
+          # merge 只会提交合并结果；本地续火花设置和工作流清理需要单独提交后才能推送。
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: preserve local workflow settings"
+          fi
+
       - name: Publish tested update
         if: steps.merge.outputs.merged == 'true'
         shell: bash
